@@ -1,0 +1,343 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Note: needs python3 to run unless we backport concurrent and urllib.parse
+#
+# Example command that can be run in a cron:
+#   export PYTHONPATH=/home/milimetric/refinery/python
+#   python3 sqoop-mediawiki-tables \
+#     --output-dir /user/milimetric/wmf/data/raw/mediawiki/tables \
+#     --user research \
+#     --password-file /user/milimetric/mysql-analytics-research-client-pw.txt \
+#     --wiki-file "/mnt/hdfs/wmf/refinery/current/static_data/mediawiki/grouped_wikis/grouped_wikis_test.csv" \
+#     --tables revision,archive,page,logging,user,user_groups \
+#     --partition-name snapshot \
+#     --partition-value test \
+#     --output-format avrodata \
+#     --log-file sqoop-info-and-above.log
+
+"""
+Sqoops a list of tables from a list of wikis into a target HDFS location
+NOTE: the options in the Usage below are in weird order because of a bug
+in docopt that makes it fail if -- is the first thing on a line, we should
+upstream a fix for that.
+
+Usage:
+  sqoop-mediawiki-tables --output-dir HDFS_PATH
+          [--clouddb] --user NAME --password-file FILE
+          [--max-tries TRIES] --wiki-file WIKIS --tables TABLES
+          [--verbose] [--from-timestamp FROM] [--to-timestamp TO]
+          [--force] --partition-name PART --partition-value PVAL
+          [--mappers NUM] [--processors NUM]  [--fetch-size NUM]
+          [--hdfs-tmp-path HTMP]  [--local-tmp-path LTMP]
+          [--job-name JOB_NAME] [--jar-file JAR_IN] --output-format FMT
+          [--yarn-queue QUEUE] [--driver-class CLASS]
+          [--sample-wiki-for-jar WIKI] [--log-file LOG] [--dry-run]
+
+Options:
+    -h --help                           Show this help message and exit.
+    -v --verbose                        Turn on verbose debug logging.
+
+    -d HDFS_PATH --output-dir HDFS_PATH Target hdfs directory to write to
+
+    -w FILE --wiki-file FILE            File with list of wiki dbs to sqoop
+                                          A csv file of the form:
+
+                                          dbname,parallel-group,...
+
+                                          where all wiki dbs that will be
+                                          sqooped in parallel with this one
+                                          share the same parallel-group
+    -t TABLES --tables TABLES           Comma-separated list of mediawiki table names.
+                                        Limit the import to these specific tables.  This
+                                        is required and jobs using this script should
+                                        coordinate so as to not import the same table
+                                        in two different ways.
+    -F FROM --from-timestamp FROM       Get records with time >= this for all tables that
+                                        have timestamps.  Format is YYYYMMDD000000
+                                        [optional]
+    -T TO --to-timestamp TO             Get records with time <  this for all tables that
+                                        have timestamps.  Format is YYYYMMDD000000
+                                        [optional]
+    -s PART --partition-name PART       The name of the partition to use for this data.
+                                        (for example, in month=2018-02, --partition-name
+                                        is snapshot)
+    -x PVAL --partition-value PVAL      The value to write to --partition-name for data
+                                        imported with this script, (for example, in
+                                        snapshot=2018-02, --partition-value is 2018-02)
+    -u NAME --user NAME                 mysql user to use
+    -p FILE --password-file FILE        File with mysql password to use
+
+    -m NUM --mappers NUM                The maximum number of mappers to use to sqoop big tables.
+                                        The actual number of mappers used for each wiki depends
+                                        on the number of processors used (see below) and the
+                                        number of wikis grouped together. If the number of wikis
+                                        in the group is bigger than the number of processors, use
+                                        1 mapper, otherwise use the number of mappers defined here
+                                        [optional] default is 1
+    -k NUM --processors NUM             The maximum number of parallel processors sqooping.
+                                        Pools are build depending on mappers defined per job,
+                                        so that no more that '--mappers' run in parallel
+                                        [optional] default is the number of
+                                        processors on the machine
+    -c NUM --fetch-size NUM             The number of rows to fetch at once from mysql.
+                                        [optional] default is None
+    -j JOB_NAME --job-name JOB_NAME     The yarn job name prefix, only one job with
+                                        a certain prefix can run at a time.
+                                        [optional] default is sqoop-mediawiki-tables
+    -e TRIES --max-tries TRIES          Maximum number of tries for a sqoop job in
+                                        case of failure [default: 3]
+    -a FMT --output-format FMT          Output format for the sqoop jobs. Accepted
+                                        values are 'avrodata' or 'parquet'.
+    -g HTMP --hdfs-tmp-path HTMP        HDFS folder where to temporary sqoop data
+                                        before renaming. [default: /wmf/tmp/analytics/sqoop-mw]
+    -G LTMP --local-tmp-path LTMP       Local folder where to temporary store generated
+                                        jar files. [default: /tmp/sqoop-jars]
+    -l --clouddb                        If set, add '_p' postfix to table names for clouddb,
+                                        otherwise look up the hostname for each db
+    -f --force                          Deleting existing folders before importing
+                                        instead of failing
+    -r JAR_IN --jar-file JAR_IN         Disable code generation and use a jar file
+                                        with pre-compiled ORM classes.  The class names
+                                        will be convention-based and assumed to be the
+                                        same as running this script with -g
+    -b WIKI --sample-wiki-for-jar WIKI  Sample wiki database used to generate the jar.
+                                        [default: etwiki]
+    -q QUEUE --yarn-queue QUEUE         Yarn queue to run the jobs in [default: default]
+    -D CLASS --driver-class CLASS       The java class to use to connect to the database
+                                        [optional]
+    -o LOG --log-file LOG               A log file to send all output to.  If not passed,
+                                        the script will only log WARN to console.
+    -y --dry-run                        The script will run and log messages, but it
+                                        won't load any data or have any consequences.
+"""
+__author__ = 'Dan Andreesu <milimetric@wikimedia.org>'
+
+import csv
+import logging
+import os
+import sys
+import datetime
+
+from subprocess import check_call, DEVNULL
+from docopt import docopt
+from concurrent import futures
+from itertools import groupby
+from traceback import format_exc
+from tempfile import mkstemp
+
+from refinery.logging_setup import configure_logging
+from refinery.sqoop import (
+    check_hdfs_path_or_exit, check_already_running_or_exit,
+    SqoopConfig, sqoop_wiki, validate_tables_and_get_queries,
+)
+from refinery.util import get_mediawiki_section_dbname_mapping, get_jdbc_string
+
+logger = logging.getLogger()
+
+
+if __name__ == '__main__':
+    # parse arguments
+    arguments = docopt(__doc__)
+    verbose                             = arguments.get('--verbose')
+    yarn_job_name_prefix                = arguments.get('--job-name')
+
+    target_hdfs_directory               = arguments.get('--output-dir')
+    user                                = arguments.get('--user')
+    password_file                       = arguments.get('--password-file')
+
+    db_list_file                        = arguments.get('--wiki-file')
+    import_tables_str                   = arguments.get('--tables')
+    clouddb                             = arguments.get('--clouddb')
+
+    from_timestamp                      = arguments.get('--from-timestamp')
+    to_timestamp                        = arguments.get('--to-timestamp')
+    partition_name                      = arguments.get('--partition-name')
+    partition_value                     = arguments.get('--partition-value')
+
+    num_mappers                         = int(arguments.get('--mappers') or '1')
+    num_processors                      = int(arguments.get('--processors')) if arguments.get('--processors') else None
+    fetch_size                          = int(arguments.get('--fetch-size')) if arguments.get('--fetch-size') else None
+
+    output_format                       = arguments.get('--output-format')
+
+    hdfs_tmp_path                       = arguments.get('--hdfs-tmp-path')
+    local_tmp_path                      = arguments.get('--local-tmp-path')
+
+    max_tries                           = int(arguments.get('--max-tries'))
+    dry_run                             = arguments.get('--dry-run')
+    force                               = arguments.get('--force')
+    jar_file                            = arguments.get('--jar-file')
+    yarn_queue                          = arguments.get('--yarn-queue')
+    driver_class                        = arguments.get('--driver-class')
+    sample_wiki                         = arguments.get('--sample-wiki-for-jar')
+    log_file                            = arguments.get('--log-file')
+
+    db_mapping                          = get_mediawiki_section_dbname_mapping()
+
+    level = logging.DEBUG if verbose else logging.INFO
+    configure_logging(logger, level, log_file=log_file)
+
+    logger.info('************ NOTE ************')
+    logger.info('When sqooping from cloud, resulting data will be shareable with the public '
+                'but when sqooping from production, resulting data may need to be redacted or '
+                'otherwise anonymized before sharing.')
+    logger.info('^^^^^^^^^^^^ NOTE ^^^^^^^^^^^^')
+
+    if dry_run:
+        logger.info('**********************************************')
+        logger.info('**************** DRY RUN MODE ****************')
+        logger.info('**** Only logging, no action in this mode ****')
+        logger.info('**********************************************')
+
+    if output_format not in ['avrodata', 'parquet']:
+        raise Exception('Invalid output-format {}'.format(output_format))
+
+    logger.debug('Started Shell with with {}'.format(' '.join(arguments)))
+
+    table_path_template = '{hdfs}/{table}/{partition_name}={partition_value}'.format(
+        hdfs=target_hdfs_directory,
+        table='{table}',
+        partition_name=partition_name,
+        partition_value=partition_value,
+    )
+    import_tables = import_tables_str.split(',')
+
+    yarn_job_name_prefix = yarn_job_name_prefix or 'sqoop-mediawiki-tables'
+    queries = validate_tables_and_get_queries(import_tables, from_timestamp, to_timestamp)
+
+    check_already_running_or_exit(yarn_job_name_prefix)
+    logger.debug('No other running instances, proceeding')
+
+    check_hdfs_path_or_exit(queries.keys(), table_path_template, hdfs_tmp_path, force, dry_run)
+    logger.debug('All table paths are empty or force cleaned')
+
+    failed_jobs = []
+    sqoop_commands = []
+
+    ####################################################
+    # First Step - Generate JAR using etwiki if no jar_file specifiec
+    # Note: We need to make sure the database we use to generate the ORM jar is
+    #       sqoopable on all tables we want to sqoop for ORM classes to be
+    #       available in the jar for all sqooped tables.
+    #       See sqoopable_dbnames in sqoop.py.
+
+    if not jar_file:
+        now_dt = datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+        target_jar_directory = os.path.join(local_tmp_path, now_dt)
+        jar_path = os.path.join(target_jar_directory, 'mediawiki-tables-sqoop-orm.jar')
+
+        logger.info('Generating ORM jar at {}'.format(jar_path))
+
+        jdbc_string = get_jdbc_string(sample_wiki, clouddb, db_mapping)
+        for table in queries.keys():
+            sqoop_commands.append(
+                SqoopConfig(yarn_job_name_prefix, user, password_file, jdbc_string, 1,
+                            None, None, None, None, sample_wiki, table, queries,
+                            target_jar_directory, None, yarn_queue, driver_class, 1,
+                            False))
+
+        with futures.ProcessPoolExecutor(num_processors) as executor:
+            failed_jobs.extend(filter(None, list(executor.map(sqoop_wiki, sqoop_commands))))
+            if len(failed_jobs):
+                failed_tables = ', '.join([c.table for c in failed_jobs])
+                logger.error('ERROR generating ORM jar for {}'.format(failed_tables))
+                sys.exit(1)
+
+        check_call([
+            'jar', 'cf', jar_path, '-C', target_jar_directory, '.',
+        ], stdout=DEVNULL, stderr=DEVNULL)
+        jar_file = jar_path
+        logger.info('ORM jar generated at {}'.format(jar_path))
+
+    ####################################################
+    # Second Step - Sqoop data using generated jar
+    # Note: We need to make sure the database we want to sqoop contains all the
+    #       tables defined for the sqooping, for some tables are present only if some
+    #       extension is enabled for the database.
+    #       We keep track of database being sqoopable per table in sqoop.py
+    #       See sqoopable_dbnames in sqoop.py
+
+    # read in the wikis to process and sqoop each one
+    with open(db_list_file) as dbs_file:
+        # Remove lines starting with hashes
+        flat_wikis = [row for row in csv.reader(dbs_file) if not row[0].startswith('#')]
+
+    failed_jobs = []
+    sqoop_commands_map = {}
+    for group, wikis in groupby(flat_wikis, lambda w: w[1]):
+        logger.debug('Processing group {}'.format(group))
+
+        # get wiki_db from rows containing: wiki, group, size
+        wikiList = [w[0] for w in list(wikis)]
+
+        # Use as many processors as wikis in the list, up to num_processors
+        num_processors_adjusted = min(len(wikiList), num_processors)
+        # Use a number of mappers that sum up to num_mappers
+        # when having more than one processors
+        num_mappers_adjusted = num_mappers / num_processors_adjusted
+        # use 1 mapper only if number of wikis in group is higher
+        # than number of processors
+        if len(wikiList) > num_processors:
+            num_mappers_adjusted = 1
+
+        for wiki_db in wikiList:
+            jdbc_string = get_jdbc_string(wiki_db, clouddb, db_mapping)
+            for table in queries.keys():
+                config = SqoopConfig(yarn_job_name_prefix, user, password_file, jdbc_string,
+                                     num_mappers_adjusted, fetch_size, output_format,
+                                     hdfs_tmp_path, table_path_template, wiki_db, table,
+                                     queries, None, jar_file, yarn_queue, driver_class, 1,
+                                     dry_run)
+                # Pool-size is at maximum num_processors, or the number of parallel jobs
+                # to be possibly run in parallel: num_mappers / num_mappers_adjusted
+                pool_size = min(int(num_mappers / num_mappers_adjusted), num_processors)
+
+                if pool_size not in sqoop_commands_map:
+                    sqoop_commands_map[pool_size] = []
+                sqoop_commands_map[pool_size].append(config)
+
+    for pool_size in sqoop_commands_map:
+        # sqoop all (wiki, table) pairs in this pool-size
+        # and wait for them all to finish with retry
+        sqoop_commands = sqoop_commands_map[pool_size]
+        with futures.ProcessPoolExecutor(pool_size) as executor:
+            current_try = 0
+            while (sqoop_commands and current_try < max_tries):
+                sqoop_commands = filter(None, list(executor.map(sqoop_wiki, sqoop_commands)))
+                current_try += 1
+        failed_jobs.extend(sqoop_commands)
+
+    # Write success flags for tables NOT having failed-job
+    # Get tables having at least one failed job
+    failed_tables = set(map(lambda config: config.table, failed_jobs))
+    for table in (set(queries.keys()) - failed_tables):
+        success_file_path = table_path_template.format(table=table) + '/_SUCCESS'
+        if not dry_run:
+            check_call([
+                'hdfs', 'dfs', '-touchz',
+                success_file_path
+            ], stdout=DEVNULL, stderr=DEVNULL)
+        logger.info('Wrote Success file {}'.format(success_file_path))
+
+    # In any mode, if failed jobs, send an error email and log error
+    if failed_jobs:
+        logger.error('*' * 50)
+        logger.error('*  Jobs to re-run:')
+        for c in failed_jobs:
+            logger.error('*    - {}'.format(str(c)))
+        logger.error('*' * 50)
+
+        sys.exit(1)

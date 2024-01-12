@@ -1,0 +1,1054 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Examples of use:
+#
+#   # Delete partitions and directories from a database:
+#   refinery-drop-older-than \
+#       --database=event \
+#       --tables='.*' \
+#       --base-path=/wmf/data/event \
+#       --path-format='[^/]+/year=(?P<year>[0-9]+)(/month=(?P<month>[0-9]+)(/day=(?P<day>[0-9]+)(/hour=(?P<hour>[0-9]+))?)?)?' \
+#       --older-than=90
+#
+#   # Delete partitions for a managed table:
+#   # Since it is a managed table, both partitions and data will be deleted without the need to specify --base-path
+#   refinery-drop-older-than \
+#       --database=wmf \
+#       --tables=webrequest \
+#       --older-than=60
+#
+#   # Delete directories for non-hive data set:
+#   refinery-drop-older-than \
+#       --base-path=/wmf/data/archive/somedataset \
+#       --path-format='(?P<year>[0-9]{4})(/(?P<month>[0-9]{1,2}))?' \
+#       --older-than=31
+#
+# Note: You should make sure to put refinery/python on your PYTHONPATH.
+#   export PYTHONPATH=$PYTHONPATH:/path/to/refinery/python
+
+"""
+Drops Hive partitions and removes data directories older than a threshold.
+
+Usage: refinery-drop-older-than [options]
+
+Options:
+    -h --help                       Show this help message and exit.
+    -d --database=<database>        Hive database name. If left undefined,
+                                    Hive partitions will not be deleted.
+    -t --tables=<tables>            Regular expression that matches all table
+                                    names to drop old partitions from. If left
+                                    undefined, no partitions will be deleted.
+                                    Ex: 'table' or '(table1|table2)' or '.*'
+    -b --base-path=<path>           Absolute base path of the data directories.
+                                    If left undefined, data directories
+                                    will not be deleted. Example:
+                                    '/wmf/data/event/someschema'
+    -p --path-format=<regex>        Regular expression that matches directory
+                                    paths (relative to base path) to be
+                                    considered for deletion. Datetime values
+                                    (year, month, day and hour) should be
+                                    enclosed with named capture groups.
+                                    Use Python's notation for naming groups. Ex:
+                                    'year=(?P<year>[0-9]+)/month=(?P<month>[0-9]+)'
+                                    If you want non-leaf directories to be deleted
+                                    the regular expression should match those. Ex:
+                                    '(?P<year>[0-9]+)(/(?P<month>[0-9]+))?'
+                                    The script assumes time-based partitions are
+                                    consecutive: year=X/month=Y/day=Z (good) and
+                                    not: year=X/other=BLAH/month=Y/day=Z (bad).
+    -o --older-than=<threshold>     Drop data older than this threshold. It can be
+                                    a YYYY-MM-DD timestamp or the relative number
+                                    of days from now. If not specified, no
+                                    partitions or directories will be deleted.
+    -i --allowed-interval=<days>    If any Hive partition or data directory
+                                    to be deleted doesn't fall within the first
+                                    <days> days immediately before --older-than
+                                    threshold, do not drop any partitions or
+                                    remove any directories (no-op) and exit with
+                                    a non-0 status code. This is a required
+                                    safety measure to avoid unexpected deletion.
+    -s --skip-trash                 Permanently delete directories (do not
+                                    send them to the trash).
+    -v --verbose                    Turn on verbose debug logging.
+    -l [FILE] --log-file [FILE]     File to send info logs to. If not specified,
+                                    info and debug logs will go to stdout while
+                                    warning and error logs will go to stderr.
+    -x --execute=<checksum>         Do actually drop the due partitions and
+                                    directories. If not specified, no partitions
+                                    or directories will be deleted (dry-run).
+                                    You can obtain the security checksum by doing
+                                    a dry-run first; the checksum will be printed
+                                    to stdout when finished. Before running the
+                                    script with --execute, please check that it
+                                    is only deleting what should be deleted.
+"""
+
+from datetime import datetime, timedelta
+from docopt import docopt
+from mock import Mock, MagicMock
+from refinery.logging_setup import configure_logging
+from refinery.hive import Hive
+from refinery.hdfs import Hdfs
+import calendar
+import hashlib
+import logging
+import os
+import re
+import sys
+import unittest
+
+
+logger = logging.getLogger()
+
+# Add here base paths and databases that should never be deleted.
+# Under undeletable_base_paths you can use prefixes as well.
+undeletable_databases = ['archive']
+undeletable_base_paths = [
+    # We can not add the full /wmf/data/archive directory to this list,
+    # because we need to delete data from /wmf/data/archive/mediawiki.
+    # Therefore, we include all other subdirectories from /wmf/data/archive.
+    # TODO: Remove /wmf/data/archive/* subdirectories that aren't critical.
+    '/wmf/data/archive/backup',
+    '/wmf/data/archive/browser',
+    '/wmf/data/archive/clickstream',
+    '/wmf/data/archive/domain_abbrev_map',
+    '/wmf/data/archive/eventlogging',
+    '/wmf/data/archive/geo',
+    '/wmf/data/archive/mediacounts',
+    '/wmf/data/archive/mobile_apps',
+    '/wmf/data/archive/page',
+    '/wmf/data/archive/project',
+    '/wmf/data/archive/unique_devices',
+    '/wmf/data/archive/webrequest']
+
+
+def get_partitions_to_drop(hive, tables_regex, threshold, allowed_interval_start):
+    """
+    Gets all partitions within the given database and tables
+    that need to be dropped according to the datetime threshold.
+    Returns the partitions grouped by table in a dict.
+    Also, raises a RuntimeError if any partition to drop
+    falls outside the allowed interval.
+    """
+    partitions_to_drop = {}
+    tables = [t for t in hive.get_tables() if re.match(tables_regex, t)]
+
+    for table in tables:
+        partitions_to_drop[table] = []
+        candidate_partitions = hive.partitions(table)
+
+        for partition in candidate_partitions:
+            if should_drop_partition(partition, threshold):
+                if partition.datetime() < allowed_interval_start:
+                    raise RuntimeError(
+                        'Table {0} has partitions outside of the allowed drop interval.'
+                        .format(table))
+                partitions_to_drop[table].append(partition.spec())
+
+    return partitions_to_drop
+
+
+def should_drop_partition(partition, threshold):
+    """
+    Returns True, if the given partition's end datetime is older
+    than the given threshold. Returns False otherwise.
+    """
+    partition_dt = partition.datetime()
+
+    if "hour" in partition:
+        partition_end = partition_dt.replace(minute=59, second=59)
+    elif "day" in partition or "date" in partition:
+        partition_end = partition_dt.replace(hour=23, minute=59, second=59)
+    # currently supported interpretation of a 'snapshot' are:
+    # * the start of a week
+    # * the start of a month
+    # Note that, as it stands today, this code does *not* support any other interpretation of a 'snapshot'.
+    elif "snapshot" in partition and partition.snapshot_period() == 'week':
+        partition_end = partition_dt + timedelta(days=6, hours=23, minutes=59, seconds=59)
+    elif "snapshot" in partition and partition.snapshot_period() == 'month':
+        last_day_of_month = calendar.monthrange(partition_dt.year, partition_dt.month)[1]
+        partition_end = partition_dt.replace(
+            day=last_day_of_month, hour=23, minute=59, second=59)
+    elif "month" in partition:
+        last_day_of_month = calendar.monthrange(partition_dt.year, partition_dt.month)[1]
+        partition_end = partition_dt.replace(
+            day=last_day_of_month, hour=23, minute=59, second=59)
+    elif "year" in partition:
+        partition_end = partition_dt.replace(
+            month=12, day=31, hour=23, minute=59, second=59)
+    else:
+        return False
+
+    return partition_end < threshold
+
+
+def drop_partitions(hive, partition_dict, execute):
+    """
+    If execute is set, drops the specified partitions from hive.
+    Otherwise, just logs the commands that would have been used.
+    Iterates over the partitions by table.
+    """
+    for table, partitions in partition_dict.items():
+        if len(partitions) > 0:
+            if execute:
+                logger.info('Dropping {0} Hive partitions from table {1}.{2}.'
+                    .format(len(partitions), hive.database, table))
+                hive.drop_partitions(table, partitions)
+            else:
+                logger.info(
+                    ('DRY RUN: {0} Hive partitions from table {1}.{2} ' +
+                    'would be dropped with the following command:')
+                    .format(len(partitions), hive.database, table))
+                logger.info(hive.drop_partitions_ddl(table, partitions))
+        else:
+            logger.info('No Hive partitions dropped for table {0}.{1}.'
+                .format(hive.database, table))
+
+
+def get_directories_to_remove(hdfs, base_path, path_format, threshold, allowed_interval_start):
+    """
+    Gets all directories within the given base_path that match path_format
+    and need to be removed according to the datetime threshold.
+    Returns the directories in a flat list. Also, raises a RuntimeError
+    if any directory to remove falls outside the allowed interval.
+    """
+    full_path_format = os.path.join(base_path, path_format)
+    directories_to_expand = [base_path]
+    directories_to_remove = []
+
+    while len(directories_to_expand) > 0:
+        # Collect the sub-paths of the directories to expand (deletion candidates).
+        # Note that hdfs.ls(F) will return F, if F is a file path (not a directory path).
+        # Filter out such 'recursive' paths to avoid infinite loops.
+        candidate_paths = [
+            path for path in hdfs.ls(directories_to_expand)
+            if path not in directories_to_expand
+        ]
+        # Empty directories to expand for next iteration.
+        directories_to_expand = []
+
+        for candidate_path in candidate_paths:
+            time_interval = extract_time_interval_from_directory(candidate_path, full_path_format)
+            if time_interval is None:
+                # No time information was found in the path.
+                if path_is_partial_match(full_path_format, candidate_path):
+                    # The path still can contain data to be deleted.
+                    directories_to_expand.append(candidate_path)
+                continue
+
+            start_time, end_time = time_interval
+            if end_time < threshold:
+                # The whole directory needs to be removed.
+                if start_time < allowed_interval_start:
+                    # The directory starts before the allowed_interval_start.
+                    # This doesn't mean necessarily that it can not be removed,
+                    # since the data inside the directory might still fall within
+                    # the allowed_interval_start. For instance, at the end of months
+                    # when a monthly directory only contains the subdirectory of
+                    # the last day of that month. Thus, we have to look inside the
+                    # directory and get the time of the oldest data within it.
+                    # NOTE: If the data_start_time is None, it means the directory
+                    # is empty and we should remove it.
+                    data_start_time = get_data_start_time(hdfs, candidate_path, full_path_format, start_time)
+                    if data_start_time is not None and data_start_time < allowed_interval_start:
+                        # The directory contains data outside of the allowed interval.
+                        raise RuntimeError(
+                            'Path {0} has directories outside of the allowed drop interval.'
+                            .format(candidate_path))
+                directories_to_remove.append(candidate_path)
+            elif start_time < threshold:
+                # The threshold is in between the directory's start and end.
+                # We need to go deeper to determine which subfolders are deleted.
+                directories_to_expand.append(candidate_path)
+
+    return directories_to_remove
+
+
+def get_data_start_time(hdfs, path, path_format, path_start_time):
+    """
+    Returns a datetime object containing the start time of the oldest data
+    within the given directory. If the directory doesn't have data, returns None.
+    Assumes that the given path has time information (path_start_time is not None).
+    """
+    child_paths = hdfs.ls([path])
+
+    if len(child_paths) == 0:
+        # The given path is an empty directory.
+        return None
+    elif len(child_paths) == 1 and child_paths[0] == path:
+        # The given path is a file.
+        return path_start_time
+    else:
+        # The given path is a non-empty directory.
+        # Determine the oldest child.
+        oldest_child_path, oldest_child_start_time = None, None
+        for child_path in child_paths:
+            child_time_interval = extract_time_interval_from_directory(child_path, path_format)
+            if child_time_interval is None:
+                # The child path has no further time information.
+                # We consider it to be data belonging to the current directory.
+                return path_start_time
+            if oldest_child_start_time is None or child_time_interval[0] < oldest_child_start_time:
+                oldest_child_start_time = child_time_interval[0]
+                oldest_child_path = child_path
+
+        # Recursive call to get the data start time from the oldest child.
+        return get_data_start_time(hdfs, oldest_child_path, path_format, oldest_child_start_time)
+
+
+def remove_directories(hdfs, directories, skip_trash, execute):
+    """
+    If execute is specified, then removes the specified directories from hdfs.
+    Otherwise, just logs the commands that would have been used.
+    """
+    if len(directories) > 0:
+        if execute:
+            logger.info('Removing {0} directories.'.format(len(directories)))
+            hdfs.rm(' '.join(directories), skip_trash=skip_trash)
+        else:
+            logger.info(
+                'DRY RUN: {0} directories would be removed with the following command:'
+                .format(len(directories)))
+            logger.info(
+                'hdfs dfs -rm -R ' +
+                ('-skipTrash  \\\n' if skip_trash else '\\\n') +
+                ' \\\n'.join(directories))
+    else:
+        logger.info('No directories removed.')
+
+
+def extract_time_interval_from_directory(path, full_path_format):
+    """
+    Returns the start datetime and the end datetime of the given
+    path, using the full path format to extract time information.
+    If the path does not match the format spec, or no time information
+    can be extracted from the path, returns None.
+    """
+    if not full_path_format.endswith('$'):
+        full_path_format += '$'
+
+    match = re.match(full_path_format, path)
+    if match:
+        group_dict = match.groupdict()
+
+        if group_dict.get('year') is None:
+            # Year is required.
+            return None
+        year = int(group_dict['year'])
+        if group_dict.get('month') is None:
+            start_month, start_day, start_hour = 1, 1, 0
+            end_month, end_day, end_hour = 12, 31, 23
+        else:
+            start_month = end_month = int(group_dict['month'])
+            if group_dict.get('day') is None:
+                start_day, start_hour = 1, 0
+                # Get last day of month.
+                end_day, end_hour = calendar.monthrange(year, end_month)[1], 23
+            else:
+                start_day = end_day = int(group_dict['day'])
+                if group_dict.get('hour') is None:
+                    start_hour = 0
+                    end_hour = 23
+                else:
+                    start_hour = end_hour = int(group_dict['hour'])
+
+        start_datetime = datetime(year, start_month, start_day, start_hour, 0, 0)
+        end_datetime = datetime(year, end_month, end_day, end_hour, 59, 59)
+        return (start_datetime, end_datetime)
+
+    return None
+
+
+def path_is_partial_match(regex, path):
+    """
+    Returns True if the given path fully matches
+    a prefix of the given regular expression.
+    """
+    for i in range(1, len(regex) + 1):
+        partial_regex = regex[:i].rstrip('$') + '$'
+        try:
+            if re.match(partial_regex, path):
+                return True
+        except re.error:
+            pass
+    return False
+
+
+def get_security_checksum(args):
+    """
+    Returns an md5 digest of the script's significant arguments.
+    """
+    # When changing these arguments, checksum is not altered.
+    excluded_args = ['--verbose', '--log-file', '--execute']
+
+    hash_args = {k: v for k, v in args.items() if k not in excluded_args}
+    hash_message = str.encode(str(sorted(hash_args.items())))
+
+    md5 = hashlib.md5()
+    md5.update(hash_message)
+    return md5.hexdigest()
+
+
+def main(args):
+    """
+    Parses and checks main arguments and checksum.
+    Then applies partition dropping and/or directory removal.
+    """
+    database = args['--database']
+    tables_regex = args['--tables']
+    base_path = args['--base-path']
+    path_format = args['--path-format']
+    older_than = args['--older-than']
+    allowed_interval = args['--allowed-interval']
+    skip_trash = args['--skip-trash']
+    execute = args['--execute']
+
+    if execute is None:
+        logger.info('Starting DRY-RUN.')
+    else:
+        logger.info('Starting EXECUTION.')
+
+    # Check database and tables arguments.
+    if database is not None:
+        if database in undeletable_databases:
+            raise RuntimeError(
+                'The argument --database can not equal any of {0}.'
+                .format(undeletable_databases))
+        if tables_regex is None:
+            raise RuntimeError(
+                'The argument --tables is mandatory when using --database.')
+
+    # Check and format tables_regex argument.
+    if tables_regex is not None and not tables_regex.endswith('$'):
+        tables_regex += '$'
+
+    # Check base path and path format arguments.
+    if base_path is not None:
+        if not base_path.startswith('/'):
+            raise RuntimeError('The argument --base-path has to be absolute.')
+        if base_path.count('/') < 3:
+            raise RuntimeError(
+                'The argument --base-path needs to have depth 3 or more.')
+        for path in undeletable_base_paths:
+            if os.path.normpath(base_path).startswith(path):
+                raise RuntimeError(
+                    'The argument --base-path can not start with any of {0}.'
+                    .format(undeletable_base_paths))
+        if path_format is None:
+            raise RuntimeError(
+                'The argument --path-format is mandatory when using --base-path.')
+
+    # Check and format older than argument.
+    if older_than is None:
+        raise RuntimeError('The argument --older-than is mandatory.')
+    # Assume that the older_than value is a date string first.
+    try:
+        threshold = datetime.strptime(older_than, '%Y-%m-%d')
+    except (TypeError, ValueError):
+        # Check if the older_than value is an integer before giving up.
+        if not older_than.isdigit():
+            raise RuntimeError(
+                'The argument --older-than must be a date or an int.')
+        now_hourly_truncated = datetime.now().replace(minute=0, second=0, microsecond=0)
+        threshold = now_hourly_truncated - timedelta(days=int(older_than))
+
+    # Check and format allowed interval argument.
+    if allowed_interval is None:
+        raise RuntimeError('The argument --allowed-interval is mandatory.')
+    else:
+        if allowed_interval.isdigit():
+            allowed_interval_start = threshold - timedelta(days=int(allowed_interval))
+        else:
+            raise RuntimeError('The argument --allowed-interval must be an int.')
+
+    # Check and format security checksum.
+    checksum = get_security_checksum(args)
+    if execute is not None and execute != checksum:
+        raise RuntimeError('Invalid security checksum passed with --execute.')
+
+    # Collect and check partitions to drop.
+    partitions_to_drop = get_partitions_to_drop(
+        Hive(database),
+        tables_regex,
+        threshold,
+        allowed_interval_start
+    ) if database is not None else {}
+
+    # Collect and check directories to remove.
+    directories_to_remove = get_directories_to_remove(
+        Hdfs,
+        base_path,
+        path_format,
+        threshold,
+        allowed_interval_start
+    ) if base_path is not None else {}
+
+    # Drop selected partitions.
+    if database is not None:
+        drop_partitions(
+            Hive(database),
+            partitions_to_drop,
+            execute is not None)
+
+    # Remove selected directories.
+    if base_path is not None:
+        remove_directories(
+            Hdfs,
+            directories_to_remove,
+            skip_trash,
+            execute is not None)
+
+    if execute is None:
+        logger.info('DRY-RUN finished.')
+        print('Security checksum (use --help for more information): {0}'
+              .format(checksum))
+    else:
+        logger.info('EXECUTION finished.')
+
+
+class TestRefineryDropOlderThan(unittest.TestCase):
+    """
+    These tests are run automatically every time this script is invoked.
+    Regardless whether in dry-run mode or execute mode. It is a security
+    measure to prevent execution if the code is not behaving as expected.
+    """
+
+    class FakeHive(object):
+        def __init__(self, tables=[], partitions=[]):
+            self.database = 'fake_database'
+            self.get_tables = MagicMock(return_value=tables)
+            self.partitions = MagicMock(return_value=partitions)
+            self.drop_partitions = MagicMock()
+            self.drop_partitions_ddl = MagicMock()
+
+    class FakePartition(object):
+        def __init__(self, dt, spec, keys=[], snapshot_period=None):
+            self.datetime = MagicMock(return_value=dt)
+            self.spec = MagicMock(return_value=spec)
+            self.keys = keys
+            self.snapshot_period = MagicMock(return_value=snapshot_period)
+        def __iter__(self):
+            return iter(self.keys)
+
+    class FakeHdfs(object):
+        def __init__(self, paths=[]):
+            self.ls = MagicMock(return_value=paths)
+            self.rm = MagicMock()
+
+    class FakeHdfsTree(object):
+        """Mock that uses a tree of directory dictionaries to behave like a filesystem."""
+        def __init__(self, path_tree):
+
+            def get_paths(paths):
+                """This is a little extra complicated because hdfs.ls() can take an array of paths."""
+                result = []
+
+                for path in paths:
+                    current = path_tree
+                    parts = path.lstrip(os.path.sep).split(os.path.sep)
+
+                    for part in parts:
+                        if part not in current:
+                            raise RuntimeError('FakeHdfsTree: Path {0} does not exist.'.format(path))
+                        current = current[part]
+
+                    if type(current) is dict:
+                        # Path is a folder.
+                        files = [
+                            os.path.join(path, name)
+                            for name in sorted(current.keys())
+                        ]
+                        result += files
+                    elif current is None:
+                        # Path is a file.
+                        result.append(path)
+
+                return result
+
+            self.ls = Mock(side_effect=get_paths)
+            self.rm = MagicMock()
+
+    def setUp(self):
+        logger.disabled = True
+
+    def tearDown(self):
+        logger.disabled = False
+
+    def run_main(self, override):
+        default_args = {
+            '--database': 'testdatabase',
+            '--tables': '(testtable1|testtable2)',
+            '--base-path': '/test/data/path',
+            '--path-format': 'test/(?P<year>[0-9]+)(/(?P<month>[0-9]+))?',
+            '--older-than': '90',
+            '--allowed-interval': '18250', # 50 years
+            '--skip-trash': None,
+            '--execute': None}
+        default_args.update(override)
+        main(default_args)
+
+    def test_raises_error_with_undeletable_database(self):
+        with self.assertRaises(RuntimeError):
+            self.run_main({'--database': 'archive'})
+
+    def test_raises_error_with_relative_base_path(self):
+        with self.assertRaises(RuntimeError):
+            self.run_main({'--base-path': 'relative/base/path'})
+
+    def test_raises_error_with_short_base_path(self):
+        with self.assertRaises(RuntimeError):
+            self.run_main({'--base-path': '/short/path'})
+
+    def test_raises_error_with_undeletable_base_path(self):
+        with self.assertRaises(RuntimeError):
+            self.run_main({'--base-path': '/wmf/data/archive/backup'})
+        with self.assertRaises(RuntimeError):
+            self.run_main({'--base-path': '/wmf/data/archive/pageviews'})
+
+    def test_raises_error_with_invalid_older_than(self):
+        with self.assertRaises(RuntimeError):
+            self.run_main({'--older-than': '24 invalid'})
+
+    def test_raises_error_with_invalid_security_checksum(self):
+        with self.assertRaises(RuntimeError):
+            self.run_main({'--execute': 'invalid checksum'})
+
+    def test_correct_checksum_allows_execution(self):
+        # None params so that no deletions are made.
+        self.run_main({
+            '--database': None,
+            '--tables': None,
+            '--base-path': None,
+            '--path-format': None,
+            '--execute': 'e588b2d4eb50446c6e4887a7cc0b4dc3'})
+
+    def test_security_checksum_changes_with_arguments(self):
+        self.assertNotEqual(
+            get_security_checksum({'argument': 'value1'}),
+            get_security_checksum({'argument': 'value2'}))
+
+    def test_security_checksum_not_altered_by_logging_arguments(self):
+        self.assertEqual(
+            get_security_checksum({'argument': 'value'}),
+            get_security_checksum({
+                'argument': 'value',
+                '--verbose': True,
+                '--log-file': 'path'}))
+
+    def test_extract_time_interval_from_directory_is_none_without_year_group(self):
+        path = '/test/dataset'
+        format = '/test/(?P<dataset>[0-9]+)'
+        result = extract_time_interval_from_directory(path, format)
+        self.assertIsNone(result)
+
+    def test_extract_time_interval_from_directory_yearly(self):
+        path = '/test/dataset/2017'
+        format = '/test/dataset/(?P<year>[0-9]+)'
+        self.assertEqual(
+            extract_time_interval_from_directory(path, format),
+            (datetime(2017, 1, 1, 0, 0, 0), datetime(2017, 12, 31, 23, 59, 59)))
+
+    def test_extract_time_interval_from_directory_monthly(self):
+        path = '/test/dataset/2017/09'
+        format = '/test/dataset/(?P<year>[0-9]+)/(?P<month>[0-9]+)'
+        self.assertEqual(
+            extract_time_interval_from_directory(path, format),
+            (datetime(2017, 9, 1, 0, 0, 0), datetime(2017, 9, 30, 23, 59, 59)))
+
+    def test_extract_time_interval_from_directory_dayly(self):
+        path = '/test/dataset/2017/09/29'
+        format = '/test/dataset/(?P<year>[0-9]+)/(?P<month>[0-9]+)/(?P<day>[0-9]+)'
+        self.assertEqual(
+            extract_time_interval_from_directory(path, format),
+            (datetime(2017, 9, 29, 0, 0, 0), datetime(2017, 9, 29, 23, 59, 59)))
+
+    def test_extract_time_interval_from_directory_hourly(self):
+        path = '/test/dataset/2017/09/29/03'
+        format = '/test/dataset/(?P<year>[0-9]+)/(?P<month>[0-9]+)/(?P<day>[0-9]+)/(?P<hour>[0-9]+)'
+        self.assertEqual(
+            extract_time_interval_from_directory(path, format),
+            (datetime(2017, 9, 29, 3, 0, 0), datetime(2017, 9, 29, 3, 59, 59)))
+
+    def test_extract_time_interval_from_webrequest_dataloss_directory(self):
+        path = '/test/dataset/test_text/2023/4/13/8/WARNING'
+        format = '/test/dataset/((upload|text|test_text)(/(?P<year>[0-9]+)(/(?P<month>[0-9]+)(/(?P<day>[0-9]+)(/(?P<hour>[0-9]+)(/(WARNING|ERROR))?)?)?)?)?)?'
+        self.assertEqual(
+            extract_time_interval_from_directory(path, format),
+            (datetime(2023, 4, 13, 8, 0, 0), datetime(2023, 4, 13, 8, 59, 59)))
+
+    def test_get_directories_to_remove(self):
+        """
+        Because the entirety of 2017 is older than the 2018 cutoff,
+        the whole 2017 directory should be removed.
+        """
+        paths = {
+            'some':{
+                'path':{
+                    'dataset': {
+                        '2017': {
+                            '00000_0': None  # This is a file.
+                        },
+                        '2018': {
+                            '10': {},
+                            '11': {
+                                '21': {},
+                                '22': {
+                                    '01': {},
+                                    '02': {},
+                                    '03': {},
+                                    '04': {}
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        fake_hdfs = self.FakeHdfsTree(paths)
+
+        directories_to_remove = get_directories_to_remove(
+            fake_hdfs,
+            '/some/path',
+            '[^/]+/(?P<year>[0-9]+)(/(?P<month>[0-9]+)(/(?P<day>[0-9]+)(/(?P<hour>[0-9]+))?)?)?',
+            datetime(2018, 11, 22, 3),
+            datetime(2017, 1, 1, 0)
+        )
+
+        self.assertEqual(
+            directories_to_remove,
+            [
+                '/some/path/dataset/2017',
+                '/some/path/dataset/2018/10',
+                '/some/path/dataset/2018/11/21',
+                '/some/path/dataset/2018/11/22/01',
+                '/some/path/dataset/2018/11/22/02'
+            ]
+        )
+
+        # Test directory out of allowed interval.
+        with self.assertRaises(RuntimeError):
+            get_directories_to_remove(
+                fake_hdfs,
+                '/some/path',
+                '[^/]+/(?P<year>[0-9]+)(/(?P<month>[0-9]+)(/(?P<day>[0-9]+)(/(?P<hour>[0-9]+))?)?)?',
+                datetime(2018, 11, 22, 3),
+                datetime(2017, 1, 2, 0)
+            )
+
+    def test_get_directories_to_remove_for_webrequest_dataloss_case(self):
+        paths = {
+            'some':{
+                'dataset':{
+                    'upload': {
+                        '2022': {}
+                    },
+                    'test_text': {
+                        '2022': {
+                            '11': {
+                                '2': {
+                                    '5': {
+                                        'WARNING': {
+                                            '00000_0': None  # This is a file.
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        '2023': {
+                            '3': {},
+                            '11': {
+                                '2': {},
+                                '12': {
+                                    '1': {},
+                                    '2': {
+                                        'ERROR': {
+                                            'a_file_to_delete.tsv': None
+                                        }
+                                    },
+                                    '13': {
+                                        'a_file_to_keep.tsv': None
+                                    },
+                                    '14': {
+                                        'a_file_to_keep.tsv': None
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        fake_hdfs = self.FakeHdfsTree(paths)
+
+        directories_to_remove = get_directories_to_remove(
+            fake_hdfs,
+            '/some/dataset',
+            '((upload|text|test_text)(/(?P<year>[0-9]+)(/(?P<month>[0-9]+)(/(?P<day>[0-9]+)(/(?P<hour>[0-9]+)(/(WARNING|ERROR))?)?)?)?)?)?',
+            datetime(2023, 11, 12, 13),
+            datetime(2000, 1, 1, 0)
+        )
+
+        self.assertEqual(
+            directories_to_remove,
+            [
+                '/some/dataset/test_text/2022',
+                '/some/dataset/upload/2022',
+                '/some/dataset/test_text/2023/3',
+                '/some/dataset/test_text/2023/11/2',
+                '/some/dataset/test_text/2023/11/12/1',
+                '/some/dataset/test_text/2023/11/12/2'
+            ]
+        )
+
+    def test_remove_directories_does_delete_with_execute(self):
+        fake_hdfs = self.FakeHdfs()
+        remove_directories(
+            fake_hdfs,
+            ['/base/path/dataset_name/2018/11/01'],
+            False,
+            True)
+        fake_hdfs.rm.assert_called_with(
+            '/base/path/dataset_name/2018/11/01',
+            skip_trash=False)
+
+    def test_remove_directories_does_nothing_with_dryrun(self):
+        fake_hdfs = self.FakeHdfs()
+        remove_directories(
+            fake_hdfs,
+            ['/base/path/dataset_name/2018/11/01'],
+            False,
+            False)
+        fake_hdfs.rm.assert_not_called()
+
+    def test_remove_directories_sets_skip_trash_parameter(self):
+        fake_hdfs = self.FakeHdfs()
+        remove_directories(
+            fake_hdfs,
+            ['/base/path/dataset_name/2018/11/01'],
+            True,
+            True)
+        fake_hdfs.rm.assert_called_with(
+            '/base/path/dataset_name/2018/11/01',
+            skip_trash=True)
+
+    def test_get_partitions_to_drop_ignores_mismatching_table(self):
+        partition = self.FakePartition(datetime(2017, 1, 1), 'spec1', ['year'])
+        fake_hive = self.FakeHive(tables=['mismatching_table'], partitions=[partition])
+        tables_regex = '[^_]+$' # Does not match the table.
+        threshold = datetime(2019, 1, 1)
+        allowed_interval_start = datetime.fromtimestamp(0) # 1970-01-01
+        self.assertEqual(
+            get_partitions_to_drop(fake_hive, tables_regex, threshold, allowed_interval_start),
+            {})
+
+    def test_get_partitions_to_drop_filters_partitions_correctly(self):
+        partition1 = self.FakePartition(datetime(2017, 1, 1), 'spec1', ['year'])
+        partition2 = self.FakePartition(datetime(2018, 1, 1), 'spec2', ['year'])
+        fake_hive = self.FakeHive(
+            tables=['some_table'],
+            partitions=[partition1, partition2])
+        tables_regex = 'some_table$'
+        threshold = datetime(2018, 1, 1)
+        allowed_interval_start = datetime.fromtimestamp(0) # 1970-01-01
+        self.assertEqual(
+            get_partitions_to_drop(fake_hive, tables_regex, threshold, allowed_interval_start),
+            {'some_table': ['spec1']})
+
+    def test_get_partitions_to_drop_fails_with_allowed_interval(self):
+        partition1 = self.FakePartition(datetime(2017, 1, 1), 'spec1', ['year'])
+        partition2 = self.FakePartition(datetime(2018, 1, 1), 'spec2', ['year'])
+        fake_hive = self.FakeHive(
+            tables=['some_table'],
+            partitions=[partition1, partition2])
+        tables_regex = 'some_table$'
+        threshold = datetime(2018, 1, 1)
+        allowed_interval_start = datetime(2017, 10, 1)
+        with self.assertRaises(RuntimeError):
+            get_partitions_to_drop(fake_hive, tables_regex, threshold, allowed_interval_start)
+
+    def test_should_drop_partition_year_limits(self):
+        partition = self.FakePartition(datetime(2017, 1, 1), 'spec1', ['year'])
+        threshold1 = datetime(2018, 1, 1)
+        threshold2 = datetime(2017, 12, 1)
+        self.assertTrue(should_drop_partition(partition, threshold1))
+        self.assertFalse(should_drop_partition(partition, threshold2))
+
+    def test_should_drop_partition_month_limits(self):
+        partition = self.FakePartition(datetime(2017, 9, 1), 'spec1', ['month'])
+        threshold1 = datetime(2017, 10, 1)
+        threshold2 = datetime(2017, 9, 30)
+        self.assertTrue(should_drop_partition(partition, threshold1))
+        self.assertFalse(should_drop_partition(partition, threshold2))
+
+    def test_should_drop_partition_day_limits(self):
+        partition = self.FakePartition(datetime(2017, 9, 28), 'spec1', ['day'])
+        threshold1 = datetime(2017, 9, 29)
+        threshold2 = datetime(2017, 9, 28, 23)
+        self.assertTrue(should_drop_partition(partition, threshold1))
+        self.assertFalse(should_drop_partition(partition, threshold2))
+
+    def test_should_drop_partition_date_limits(self):
+        partition = self.FakePartition(datetime(2017, 9, 28), 'spec1', ['date'])
+        threshold1 = datetime(2017, 9, 29)
+        threshold2 = datetime(2017, 9, 28, 23)
+        self.assertTrue(should_drop_partition(partition, threshold1))
+        self.assertFalse(should_drop_partition(partition, threshold2))
+
+    def test_should_drop_partition_snapshot_representing_week_limits(self):
+        partition = self.FakePartition(dt=datetime(2022, 1, 1),
+                                       spec='spec1',
+                                       keys=['snapshot'],
+                                       snapshot_period='week')
+        threshold_higher = datetime(2022, 1, 8)
+        threshold_before_range = datetime(2021, 12, 31, 23, 59, 59)
+        threshold_in_range = datetime(2022, 1, 2)
+        self.assertTrue(should_drop_partition(partition, threshold_higher))
+        self.assertFalse(should_drop_partition(partition, threshold_before_range))
+        self.assertFalse(should_drop_partition(partition, threshold_in_range))
+
+    def test_should_drop_partition_snapshot_representing_month_limits(self):
+        partition = self.FakePartition(dt=datetime(2022, 1, 1),
+                                       spec='spec1',
+                                       keys=['snapshot'],
+                                       snapshot_period='month')
+        threshold_higher = datetime(2022, 2, 1)
+        threshold_before_range = datetime(2021, 12, 31, 23, 59, 59)
+        threshold_in_range = datetime(2022, 1, 8)
+        self.assertTrue(should_drop_partition(partition, threshold_higher))
+        self.assertFalse(should_drop_partition(partition, threshold_before_range))
+        self.assertFalse(should_drop_partition(partition, threshold_in_range))
+
+    def test_should_not_drop_partition_snapshot_representing_unknown_limits(self):
+        partition = self.FakePartition(dt=datetime(2022, 1, 1),
+                                       spec='spec1',
+                                       keys=['snapshot'],
+                                       snapshot_period=None)
+        threshold_higher = datetime(2022, 2, 1)
+        threshold_before_range = datetime(2021, 12, 31, 23, 59, 59)
+        threshold_in_range = datetime(2022, 1, 8)
+        self.assertFalse(should_drop_partition(partition, threshold_higher))
+        self.assertFalse(should_drop_partition(partition, threshold_before_range))
+        self.assertFalse(should_drop_partition(partition, threshold_in_range))
+
+    def test_should_drop_partition_hour_limits(self):
+        partition = self.FakePartition(datetime(2017, 9, 29, 3), 'spec1', ['hour'])
+        threshold1 = datetime(2017, 9, 29, 4)
+        threshold2 = datetime(2017, 9, 29, 3, 59)
+        self.assertTrue(should_drop_partition(partition, threshold1))
+        self.assertFalse(should_drop_partition(partition, threshold2))
+
+    def test_drop_partitions_does_delete_with_execute(self):
+        fake_hive = self.FakeHive()
+        partition = self.FakePartition(datetime(2018, 11, 30, 0), 'spec1', ['day'])
+        drop_partitions(
+            fake_hive,
+            {'t1': [partition.spec()]},
+            True)
+        fake_hive.drop_partitions.assert_called_with('t1', ['spec1'])
+
+    def test_drop_partitions_does_nothing_with_dryrun(self):
+        fake_hive = self.FakeHive()
+        partition = self.FakePartition(datetime(2018, 11, 22, 0), 'spec1')
+        drop_partitions(
+            fake_hive,
+            {'t1': [partition.spec()]},
+            False)
+        fake_hive.drop_partitions.assert_not_called()
+
+    def test_path_is_partial_match(self):
+        self.assertTrue(path_is_partial_match('[a-z]+/year=[0-9]+', 'goodlowercase'))
+        self.assertFalse(path_is_partial_match('[a-z]+/year=[0-9]+', 'badUppercase'))
+        self.assertTrue(path_is_partial_match('[a-z]+/[a-z]+/year=[0-9]+', 'ok/path'))
+        self.assertFalse(path_is_partial_match('[a-z]+/[a-z]+/year=[0-9]+', 'too/long/path'))
+        self.assertTrue(path_is_partial_match('(?!forbidden)[a-z]+/year=[0-9]+', 'allowed'))
+        self.assertFalse(path_is_partial_match('(?!forbidden)[a-z]+/year=[0-9]+', 'forbidden'))
+
+    def test_get_data_start_time(self):
+        directory_tree = {
+            'some':{
+                'path':{
+                    '2017': {
+                        '00000_0': None,  # This is a file.
+                        '00000_1': None,  # This is a file.
+                        '00000_2': None  # This is a file.
+                    },
+                    '2018': {
+                        '07': {
+                            '21': {
+                                '00000_0': None,  # This is a file.
+                            },
+                            '22': {
+                                '00000_0': None,  # This is a file.
+                            }
+                        },
+                    },
+                    '2019': {
+                        '03': {
+                            '05': {},
+                            '06': {}
+                        },
+                    }
+                }
+            }
+        }
+        fake_hdfs = self.FakeHdfsTree(directory_tree)
+        path_format = '/some/path/(?P<year>[0-9]+)(/(?P<month>[0-9]+)(/(?P<day>[0-9]+)(/(?P<hour>[0-9]+))?)?)?'
+
+        # Test getting a year directory within.
+        self.assertEqual(
+            get_data_start_time(fake_hdfs, '/some/path/2017', path_format, datetime(2017, 1, 1)),
+            datetime(2017, 1, 1)
+        )
+
+        # Test getting an day directory within a month.
+        self.assertEqual(
+            get_data_start_time(fake_hdfs, '/some/path/2018/07', path_format, datetime(2018, 7, 1)),
+            datetime(2018, 7, 21)
+        )
+
+        # Test getting result with empty directories.
+        self.assertEqual(
+            get_data_start_time(fake_hdfs, '/some/path/2019/03', path_format, datetime(2019, 3, 1)),
+            None
+        )
+
+
+if __name__ == '__main__':
+    args = docopt(__doc__)
+
+    # Configure logging.
+    verbose = args['--verbose']
+    log_file = args['--log-file']
+    log_level = logging.DEBUG if verbose else logging.INFO
+    configure_logging(logger, log_level, log_file=log_file, stdout=not log_file)
+
+    # Apply unit tests before running the script.
+    # If they fail, print test results and exit.
+    test_results = unittest.main(argv=[''], exit=False).result
+    issues = test_results.errors + test_results.failures
+    if len(issues) == 0:
+        logger.info('Unit tests passed.')
+    else:
+        for issue in issues:
+            print(issue[1].strip())
+        sys.exit(1)
+    try:
+        main(args)
+    except RuntimeError as e:
+        print('ERROR: {0}'.format(e))
+        sys.exit(1)

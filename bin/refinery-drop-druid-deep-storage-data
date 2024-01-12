@@ -1,0 +1,121 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""
+Automatically deletes the old druid deep-storage data from HDFS.
+
+Usage: refinery-drop-druid-deep-storage-data [options] <datasource>
+
+Options:
+    -h --help                       Show this help message and exit.
+    -d --older-than-days=<days>     Drop data older than this number of days. [default: 60]
+    -v --verbose                    Turn on verbose debug logging.
+    -n --dry-run                    Don't actually delete any data. Just log the http request
+                                    sent to druid
+    -f --log-file=<file>            File to send info logs to
+    --beginning-of-time=<day>       Day from which we drop data. [default: 2001-01-01]
+    --druid-host=<host>             Druid host to request [default: an-druid1001.eqiad.wmnet]
+    --druid-coord-port=<port>       Port for druid coordinator [default: 8081]
+    --druid-overlord-port=<port>    Port for druid overlord [default: 8090]
+    --no-datasource-check           Turn off datasource validity check in Druid (useful for
+                                    deleting data of a disabled datasource)
+    --wait-between-checks=<s>       Waiting time in second between task status updates.
+                                    [default: 5]
+
+"""
+__author__ = 'Joseph Allemandou <joal@wikimedia.org>'
+
+import datetime
+from   docopt   import docopt
+import logging
+import sys
+
+from refinery.logging_setup import configure_logging
+from refinery.druid import Druid
+
+logger = logging.getLogger()
+
+
+def parse_int_arg(arguments, argument_name):
+    try:
+        return int(arguments[argument_name])
+    except ValueError:
+        logger.error('Incorrect format for {0}. Integer expected.'.format(argument_name))
+        return None
+
+
+if __name__ == '__main__':
+
+    # parse arguments
+    arguments = docopt(__doc__)
+
+    # Configure logging
+    verbose = arguments['--verbose']
+    log_file = arguments['--log-file']
+    log_level = logging.DEBUG if verbose else logging.INFO
+    configure_logging(logger, log_level, log_file=log_file)
+
+    # Check arguments validity
+    try:
+        datetime.datetime.strptime(arguments['--beginning-of-time'], '%Y-%m-%d')
+        validated_beginning_of_time = arguments['--beginning-of-time']
+    except ValueError:
+        logger.error('Incorrect format for --beginning-of-time parameter. YYYY-MM-DD expected.')
+        validated_beginning_of_time = None
+    validated_druid_coord_port = parse_int_arg(arguments, '--druid-coord-port')
+    validated_druid_overlord_port = parse_int_arg(arguments, '--druid-overlord-port')
+    validated_older_than_days = parse_int_arg(arguments, '--older-than-days')
+    validated_wait_seconds = parse_int_arg(arguments, '--wait-between-checks')
+
+    # In case of any argument error, abort
+    if not (validated_beginning_of_time
+            and validated_druid_coord_port
+            and validated_druid_overlord_port
+            and validated_older_than_days
+            and validated_wait_seconds):
+        sys.exit(1)
+
+    druid_host = arguments['--druid-host']
+    datasource = arguments['<datasource>']
+    dry_run = arguments['--dry-run']
+    datasource_check = not arguments['--no-datasource-check']
+
+    # Create the Druid utility instance
+    druid = Druid(druid_host,
+                  validated_druid_coord_port,
+                  validated_druid_overlord_port)
+
+    # Check datasource if needed
+    if datasource_check and not dry_run and datasource not in druid.list_datasources():
+        logger.error('Datasource {} not found in druid.'.format(datasource))
+        sys.exit(1)
+
+    # reused time constants
+    now = datetime.datetime.utcnow()
+    dt_day_postfix = 'T00:00:00.000Z'
+
+    # Drop interval
+    itv_start = validated_beginning_of_time + dt_day_postfix
+    oldest_accepted_dt = now - datetime.timedelta(days=validated_older_than_days)
+    oldest_accepted_day = datetime.datetime.strftime(oldest_accepted_dt, '%Y-%m-%d')
+    itv_end = oldest_accepted_day + dt_day_postfix
+    interval = '{}/{}'.format(itv_start, itv_end)
+
+
+    # note that this call is going to fail if segments have not been disabled 
+    # on the druid admin UI before 
+    # Please see: https://druid.apache.org/docs/latest/tutorials/tutorial-delete-data.html
+
+    druid.delete_segments(datasource, interval, validated_wait_seconds, dry_run)

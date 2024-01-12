@@ -1,0 +1,103 @@
+{
+  "type": "kafka",
+  "dataSchema": {
+    "dataSource": "wmf_netflow",
+    "parser": {
+      "type": "string",
+      "parseSpec": {
+        "format": "json",
+        "flattenSpec": {
+          "useFieldDiscovery": false,
+          "fields": [
+              "as_dst",
+              "as_path",
+              "peer_as_dst",
+              "as_src",
+              "ip_dst",
+              "ip_proto",
+              "ip_src",
+              "peer_as_src",
+              "port_dst",
+              "port_src",
+              "country_ip_src",
+              "country_ip_dst",
+              "tag2",
+              "tcp_flags",
+              "packets",
+              "bytes",
+              "peer_ip_src",
+              "iface_out",
+              "peer_ip_dst"
+          ]
+        },
+        "timestampSpec": {
+          "column": "stamp_inserted",
+          "format": "auto"
+        },
+        "dimensionsSpec": {
+          "dimensions": [
+              "as_dst",
+              "as_path",
+              "peer_as_dst",
+              "as_src",
+              "ip_dst",
+              "ip_proto",
+              "ip_src",
+              "peer_as_src",
+              "port_dst",
+              "port_src",
+              "country_ip_src",
+              "country_ip_dst",
+              "tag2",
+              "tcp_flags",
+              "peer_ip_src",
+              "forwarded"
+          ]
+        }
+      }
+    },
+    "transformSpec": {
+      "transforms": [
+        {
+          "type": "expression",
+          "name": "forwarded",
+          "expression": "!(iface_out == 0 && (peer_ip_dst == '::' || peer_ip_dst == '0.0.0.0'))"
+        }
+      ]
+    },
+    "metricsSpec": [
+      {
+        "name": "count",
+        "type": "count"
+      },
+      {
+        "name": "bytes",
+        "type": "doubleSum",
+        "fieldName": "bytes"
+      },
+      {
+        "name": "packets",
+        "type": "doubleSum",
+        "fieldName": "packets"
+      }
+    ],
+    "granularitySpec": {
+      "type": "uniform",
+      "segmentGranularity": "HOUR",
+      "queryGranularity": "SECOND"
+    }
+  },
+  "tuningConfig": {
+    "type": "kafka",
+    "maxRowsPerSegment": 5000000
+  },
+  "ioConfig": {
+    "topic": "netflow",
+    "consumerProperties": {
+      "bootstrap.servers": "kafka-jumbo1007.eqiad.wmnet:9092,kafka-jumbo1008.eqiad.wmnet:9092,kafka-jumbo1009.eqiad.wmnet:9092,kafka-jumbo1010.eqiad.wmnet:9092,kafka-jumbo1011.eqiad.wmnet:9092,kafka-jumbo1012.eqiad.wmnet:9092,kafka-jumbo1013.eqiad.wmnet:9092,kafka-jumbo1014.eqiad.wmnet:9092,kafka-jumbo1015.eqiad.wmnet:9092"
+    },
+    "taskCount": 1,
+    "replicas": 3,
+    "taskDuration": "PT1H"
+  }
+}

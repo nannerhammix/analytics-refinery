@@ -1,0 +1,222 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Note: You should make sure to put refinery/python on your PYTHONPATH.
+#   export PYTHONPATH=$PYTHONPATH:/path/to/refinery/python
+#
+# Will be scheduled on a cron, every 7 days, as:
+#   download-project-namespace-map -c \
+#     --output-hdfs /wmf/data/raw/mediawiki/project_namespace_map
+
+"""
+Writes the WMF site matrix as projects with namespace information to a file
+
+Usage:
+  download-project-namespace-map.py (--output-file FILE|--output-hdfs PATH)
+          [-c] [-v] [-s SNAPSHOT] [-p PROXY]
+
+Options:
+    -h --help                           Show this help message and exit.
+    -v --verbose                        Turn on verbose debug logging.
+    -c --include-closed                 Include wikis that are now closed.
+    -o FILE --output-file FILE          Output the results here
+                                        (default: ./project-namespace-map.csv).
+    -x PATH --output-hdfs PATH          Output the results to HDFS
+    -s SNAPSHOT --snapshot SNAPSHOT     The snapshot partition to load data
+                                        into (usually YYYY-MM) when writing
+                                        to HDFS
+    -p PROXY --proxy PROXY              The HTTPS proxy to use
+"""
+__author__ = 'Dan Andreesu <milimetric@wikimedia.org>'
+
+import requests
+import json
+import csv
+import logging
+import os
+import sys
+
+from docopt import docopt
+from traceback import format_exc
+from tempfile import mkstemp
+from subprocess import check_call
+
+
+outfile = 'project_namespace_map.csv'
+
+headers = {
+    'User-Agent': 'Wikimedia Foundation Analytics Bot',
+    'From': 'dandreescu@wikimedia.org'
+}
+
+wikis_query = ''.join([
+    'https://www.mediawiki.org/w/api.php?action=sitematrix',
+    '&smsiteprop=code|dbname|sitename|lang|url',
+    '&smstate=all',
+    '&format=json',
+])
+
+namespace_query = ''.join([
+    '/w/api.php?action=query',
+    '&format=json',
+    '&meta=siteinfo',
+    '&siprop=general|namespaces',
+])
+
+if __name__ == '__main__':
+    # parse arguments
+    arguments = docopt(__doc__)
+    verbose         = arguments['--verbose']
+    outfile         = arguments['--output-file']
+    outhdfs         = arguments['--output-hdfs']
+    closed          = arguments['--include-closed']
+    snapshot        = arguments['--snapshot']
+    proxy           = arguments['--proxy']
+
+    # If we're outputting to hdfs, output to a temp file and copy up
+    output_to_hdfs = outhdfs is not None
+    if output_to_hdfs:
+        outfile = mkstemp()[1]
+
+    log_level = logging.INFO
+    if verbose:
+        log_level = logging.DEBUG
+
+    proxies = {'https': proxy} if proxy else {}
+
+    logging.basicConfig(level=log_level,
+                        format='%(asctime)s %(levelname)-6s %(message)s',
+                        datefmt='%Y-%m-%dT%H:%M:%S')
+
+
+def get_wikis(closed):
+    matrix = requests.get(
+        wikis_query,
+        headers=headers,
+        proxies=proxies
+    ).json().get('sitematrix', {})
+
+    wikis = [
+
+        wiki
+
+        for language in matrix.values()
+        if type(language) is dict and 'site' in language
+
+        for wiki in language['site']
+    ] + [
+
+        wiki
+
+        for wiki in matrix.get('specials', [])
+    ]
+
+    return [
+        wiki
+        for wiki in wikis
+        if 'private' not in wiki and (closed or 'closed' not in wiki)
+    ]
+
+
+wikis = get_wikis(closed)
+namespaceDictionary = {}
+
+logging.info('Fetching namespace info for {} wikis'.format(len(wikis)))
+
+###
+# Writes mapping as: (hostname, dbname, ns integer, ns canonical, ns localized, content)
+# hostname      : ja.wikipedia.org
+# language      : ja
+# sitename      : Wikipedia
+# dbname        : jawiki
+# home page     : https://ja.wikipedia.org/wiki/%E3%83%A1%E3%82%A4%E3%83%B3%E3%83%9A%E3%83%BC%E3%82%B8
+# mw version    : MediaWiki 1.41.0-wmf.28
+# case setting  : first-letter
+# namespace     : 2, 100, etc.
+# ns canonical  : the english prefix if exists, otherwise the localized prefix
+# ns localized  : the localized prefix
+# content       : whether or not this namespace is a content namespace
+###
+
+wiki_mappings_written = 0
+
+with open(outfile, 'w', encoding='utf-8') as w:
+    spamwriter = csv.writer(w)
+
+    for wiki in wikis:
+        site = wiki.get('url', '')
+        sitename = wiki.get('sitename', '')
+        lang = wiki.get('lang', '')
+        host = site.replace('https://', '')
+        dbname = wiki.get('dbname', host)
+        try:
+            r = requests.get(site + namespace_query, headers=headers, proxies=proxies)
+            query = json.loads(r.text)['query']
+            general = query['general']
+            home_page = general.get('base', host)
+            mw_version = general.get('generator', 'Unknown MediaWiki Version')
+            case_setting = general.get('case', 'uknown case')
+            ns = query['namespaces']
+
+            for ns_key, v in ns.items():
+                is_content = 0
+                if 'content' in v:
+                    is_content = 1
+
+                row = [
+                    host,
+                    lang,
+                    sitename,
+                    dbname,
+                    home_page,
+                    mw_version,
+                    case_setting,
+                    ns_key,
+                    v.get('canonical', ''),
+                    v.get('*', ''),
+                    v.get('case', 'unknown case'),
+                    is_content,
+                ]
+                spamwriter.writerow(row)
+                wiki_mappings_written += 1
+
+        except Exception:
+            logging.exception(site + ' FAILED!!!')
+
+
+if wiki_mappings_written == 0:
+    logging.error('The number of wiki mappings written to the CSV file is zero.')
+    sys.exit(1)
+
+if output_to_hdfs:
+    if (snapshot is not None):
+        outhdfs += '/snapshot=' + snapshot
+
+    check_call([
+        'hdfs', 'dfs', '-mkdir', '-p',
+        outhdfs,
+    ])
+
+    check_call([
+        'hdfs', 'dfs', '-put', '-f',
+        outfile,
+        outhdfs + '/project_namespace_map',
+    ])
+    check_call([
+        'hdfs', 'dfs', '-touchz',
+        outhdfs + '/_SUCCESS',
+    ])
+    # clean up the temp file
+    os.remove(outfile)

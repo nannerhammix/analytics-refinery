@@ -1,0 +1,145 @@
+#!/bin/bash
+# -*- coding: utf-8 -*-
+
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Script to assist with refinery-source .jar updates.
+# Will be used by jenkins to commit refinery-source jars after release.
+# Usage:
+#   ./bin/update-refinery-source-jars  -v <version> -u <gerrit_user> [-b <branch>  -m <mode>]
+# This will download all refinery <version> jars from archiva,
+# symlink them in ./artifacts/, and add and commit jars to git
+#
+
+set -eu
+set -o pipefail
+
+#Initialize variables to default values.
+VERSION=
+BRANCH="master"
+GERRIT_USER=
+MODE="dry-run"
+
+# List of refinery-source modules that have jars that should be symlinked.
+# This list is hardcoded now.
+# TODO: it'd be nice if we could read the refinery-source pom.xml file to automate this list.
+REFINERY_SOURCE_MODULES="core hive job spark tools"
+
+
+SCRIPT_NAME=$(basename "$0")
+
+function HELP {
+  echo "Usage: ${SCRIPT_NAME}  -v <version> -u <gerrit_user> [-b <branch>  -m <mode>]"
+  echo "Always run this script from refinery root"
+  echo "-v -- Refinery source version for which jars are to be updated. Eg. 0.0.26. Required"
+  echo "-u -- Gerrit user making the jar update commit. Required"
+  echo "-b -- Git branch in refinery to which the jar update commit should be pushed to. Default is master"
+  echo "-m -- Mode for sending updates to git remote. Values can be review, push, or dry-run. Default is dry-run"
+  echo "-h -- Display help text"
+}
+
+NUMARGS=$#
+if [ "$NUMARGS" -eq 0 ]; then
+  HELP
+fi
+
+while getopts :v:u:b:m:h OPT; do
+  case $OPT in
+    v)  #set Version
+      VERSION=$OPTARG
+      ;;
+    u)  #set Gerrit User
+      GERRIT_USER=$OPTARG
+      ;;
+    b)  #set branch
+      BRANCH=$OPTARG
+      ;;
+    m)  #set mode
+      MODE=$OPTARG
+      ;;
+    h)  #show help
+      HELP
+      exit 0
+      ;;
+    \?) #unrecognized option - show help
+      echo "Option -$OPTARG not recognized."
+      echo "See ${SCRIPT_NAME} -h for help"
+      exit 1
+      ;;
+  esac
+done
+
+if [ -z "${VERSION}" ] || [ -z "${GERRIT_USER}" ] ; then
+  echo "Missing required parameters for VERSION(-v) or GERRIT_USER(-u)"
+  echo "See ${SCRIPT_NAME} -h for help"
+  exit 1
+fi
+
+if [ "${MODE}" != "push" ] && [ "${MODE}" != "review" ] && [ "${MODE}" != "dry-run" ]; then
+  echo "Value for mode parameter (-m) can only be push, review or dry-run"
+  echo "See ${SCRIPT_NAME} -h for help"
+  exit 1
+fi
+
+archiva_base_uri="https://archiva.wikimedia.org/repository/releases/org/wikimedia/analytics/refinery"
+
+for j in $REFINERY_SOURCE_MODULES; do
+
+    # Download and symlink the standard (non shaded) version of the jar
+    (curl -Lf -o ./artifacts/org/wikimedia/analytics/refinery/"refinery-$j-${VERSION}.jar" \
+		"${archiva_base_uri}/$j/refinery-$j/$VERSION/refinery-$j-$VERSION.jar" \
+        && ln -sfv org/wikimedia/analytics/refinery/"refinery-$j-${VERSION}.jar" ./artifacts/refinery-$j.jar) &
+
+    # Download and symlink the shaded version of the jar, if it exists.
+    # (If it doesn't curl will just fail)
+    (curl -Lf -o ./artifacts/org/wikimedia/analytics/refinery/"refinery-$j-${VERSION}-shaded.jar" \
+    "${archiva_base_uri}/$j/refinery-$j/$VERSION/refinery-$j-$VERSION-shaded.jar" \
+        && ln -sfv org/wikimedia/analytics/refinery/"refinery-$j-${VERSION}-shaded.jar" ./artifacts/refinery-$j-shaded.jar) &
+
+done
+
+wait
+
+ADD_COMMAND="git add ./artifacts/refinery-*.jar ./artifacts/org/wikimedia/analytics/refinery/refinery-*-${VERSION}*.jar"
+COMMIT_COMMAND="git commit -m 'Add refinery-source jars for v${VERSION} to artifacts'"
+
+# If this is a dry run, just print the git commands to run and exit
+if [ "${MODE}" = "dry-run" ] ; then
+  echo "Result:"
+  git diff --stat
+  echo "Run the following commands to commit the new jars"
+  echo "$ADD_COMMAND"
+  echo "$COMMIT_COMMAND"
+  exit 0
+fi
+
+# Set up git fat and gerrit commit message hook
+git fat init
+gitdir=$(git rev-parse --git-dir)
+if [ ! -e "${gitdir}/hooks/commit-msg" ]; then
+  echo 'Installing Gerrit commit-msg hook ...'
+  curl -L -o "${gitdir}/hooks/commit-msg" \
+	  https://gerrit.wikimedia.org/r/tools/hooks/commit-msg
+  chmod +x "${gitdir}/hooks/commit-msg"
+fi
+
+# Run the git add and commit commands
+eval "$ADD_COMMAND"
+eval "$COMMIT_COMMAND"
+
+# Push to the remote git branch if on push mode, else submit for gerrit review
+if [ "${MODE}" = "push" ] ; then
+   git push origin "${BRANCH}"
+elif [ "${MODE}" = "review" ] ; then
+  git push origin "HEAD:refs/for/${BRANCH}"
+fi
